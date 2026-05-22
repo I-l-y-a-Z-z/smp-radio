@@ -26,12 +26,22 @@ ffmpeg_options = {
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    channel = bot.get_channel(STAGE_ID)
     
-    if channel:
+    try:
+        # fetch_channel is more reliable than get_channel if the bot cache is empty
+        channel = bot.get_channel(STAGE_ID) or await bot.fetch_channel(STAGE_ID)
+        
+        if not channel:
+            print(f"ERROR: Could not find channel with ID {STAGE_ID}. Check your .env file!")
+            return
+            
+        print(f"Found Stage: {channel.name}. Attempting to connect...")
         vc = await channel.connect()
         
-        await bot.get_guild(channel.guild.id).me.edit(suppress=False)
+        print("Connected to Stage! Attempting to become a speaker...")
+        # This requires the Administrator or Mute Members permission
+        await channel.guild.me.edit(suppress=False)
+        print("Successfully became a speaker! Starting audio stream...")
         
         while True:
             if not vc.is_playing():
@@ -40,5 +50,8 @@ async def on_ready():
                     url2 = info['url']
                     vc.play(discord.FFmpegPCMAudio(url2, **ffmpeg_options))
             await asyncio.sleep(5)
+            
+    except Exception as e:
+        print(f"CRITICAL ERROR: {e}")
 
 bot.run(TOKEN)
