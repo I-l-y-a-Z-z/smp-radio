@@ -48,22 +48,25 @@ async def radio_loop():
                 else:
                     print(f"Warning creating instance: {e}")
             
-        # 3. Check if bot is connected to the channel
+       # 3. Check if bot is connected to the channel
         vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
         
         if not vc or not vc.is_connected():
             print("Bot is not in the channel. Rebuilding connection...")
             
-            # --- THE FIX: Kill the zombie connection before reconnecting ---
+            # --- THE FIX: The Double-Tap Cleanup ---
             if vc:
-                print("Cleaning up dead network socket...")
+                print("Killing zombie FFmpeg and cleaning cache...")
+                if vc.is_playing():
+                    vc.stop()  # Assasinates the stuck FFmpeg process
                 await vc.disconnect(force=True)
+                vc.cleanup()  # Wipes Py-cord's internal voice memory
+                await asyncio.sleep(1) # Give the Linux OS a second to clear the process
                 
             vc = await channel.connect()
             print("Connected! Requesting to speak...")
             try:
                 await channel.guild.me.edit(suppress=False)
-                # --- THE FIX: Give Discord 1 second to process the speaker request ---
                 await asyncio.sleep(1) 
             except discord.HTTPException as e:
                 print(f"Permission Error trying to speak: {e}")
