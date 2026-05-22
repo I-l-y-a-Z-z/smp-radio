@@ -168,7 +168,7 @@ async def heartbeat_loop():
                         # Stage channels require properly encoded opus audio — raw PCM is silently dropped.
                         source = discord.FFmpegPCMAudio(
                             AUDIO_PATH,
-                            before_options="-stream_loop -1 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                            before_options="-stream_loop -1",
                             options="-vn -ar 48000 -ac 2 -b:a 128k"
                         )
                         vc.play(
