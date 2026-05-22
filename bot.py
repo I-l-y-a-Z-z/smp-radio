@@ -44,16 +44,24 @@ async def on_voice_state_update(member, before, after):
 
     # EDGE CASE 1: THE DISCONNECT / KICK 
     if before.channel is not None and after.channel is None:
-        log("BOUNCER-KICK", "Bot was disconnected. Executing instant local cleanup...")
+        log("BOUNCER-KICK", "Bot was disconnected. Deploying background socket execution...")
         vc = member.guild.voice_client
         if vc:
-            log("BOUNCER-KICK", f"Found dead VC. is_playing: {vc.is_playing()}")
             if vc.is_playing():
                 vc.stop() 
             
-            # THE FIX: No awaited network commands! Just instantly wipe the local memory.
-            vc.cleanup() 
-            log("BOUNCER-KICK", "Local cache wiped instantly. No race conditions.")
+            # THE FIX: Run the official disconnect as a background task. 
+            # This forces Py-cord to delete the ghost object without freezing the Bouncer!
+            async def execute_ghost(zombie_vc):
+                try:
+                    await asyncio.wait_for(zombie_vc.disconnect(force=True), timeout=2.0)
+                except:
+                    log("BOUNCER-KICK", "Disconnect timed out, forcing cache wipe...")
+                finally:
+                    zombie_vc.cleanup()
+                    log("BOUNCER-KICK", "Ghost socket fully purged from Py-cord memory.")
+
+            bot.loop.create_task(execute_ghost(vc))
         return
 
     # EDGE CASE 2: THE AUDIENCE TRAP
@@ -96,6 +104,16 @@ async def heartbeat_loop():
         # 3. Connection Logic
         if not vc or not vc.is_connected():
             log("DJ-CONNECT", "Bot is disconnected. Initiating UDP Handshake...")
+            
+            # THE FIX: If Py-cord tries to hand the DJ a dead, recycled socket, destroy it.
+            if vc:
+                log("DJ-CONNECT", "⚠️ Zombie VoiceClient detected! Ripping it out before reconnecting...")
+                try:
+                    await asyncio.wait_for(vc.disconnect(force=True), timeout=1.0)
+                except:
+                    pass
+                vc.cleanup()
+            
             try:
                 await asyncio.wait_for(channel.connect(timeout=5.0), timeout=10.0)
                 log("DJ-CONNECT", "✅ UDP Handshake complete! Connected to voice servers.")
