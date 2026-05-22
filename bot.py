@@ -1,6 +1,7 @@
 import discord
 from discord.ext import tasks
 import os
+import asyncio
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -43,7 +44,7 @@ async def radio_loop():
             except discord.HTTPException as e:
                 # Error 150006 means the Stage is already open, our cache is just blind.
                 if e.code == 150006:
-                    pass # Safely ignore and continue!
+                    pass # Safely ignore and continue
                 else:
                     print(f"Warning creating instance: {e}")
             
@@ -51,11 +52,19 @@ async def radio_loop():
         vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
         
         if not vc or not vc.is_connected():
-            print("Bot is not in the channel. Connecting...")
+            print("Bot is not in the channel. Rebuilding connection...")
+            
+            # --- THE FIX: Kill the zombie connection before reconnecting ---
+            if vc:
+                print("Cleaning up dead network socket...")
+                await vc.disconnect(force=True)
+                
             vc = await channel.connect()
             print("Connected! Requesting to speak...")
             try:
                 await channel.guild.me.edit(suppress=False)
+                # --- THE FIX: Give Discord 1 second to process the speaker request ---
+                await asyncio.sleep(1) 
             except discord.HTTPException as e:
                 print(f"Permission Error trying to speak: {e}")
         else:
@@ -64,6 +73,7 @@ async def radio_loop():
                 print("Bot was moved to audience. Reclaiming speaker status...")
                 try:
                     await channel.guild.me.edit(suppress=False)
+                    await asyncio.sleep(1)
                 except discord.HTTPException as e:
                     print(f"Permission Error reclaiming speaker: {e}")
             
@@ -72,14 +82,15 @@ async def radio_loop():
             # Only try to play if we are actually a speaker (not suppressed)
             if channel.guild.me.voice and not channel.guild.me.voice.suppress:
                 if os.path.exists(AUDIO_PATH):
-                    print(f"Starting audio: {AUDIO_PATH}")
+                    print(f"Starting/Restarting track: {AUDIO_PATH}")
+                    # Play the file natively using FFmpeg's infinite stream loop flag
                     vc.play(discord.FFmpegPCMAudio(
                         AUDIO_PATH, 
                         before_options='-stream_loop -1', 
                         options='-vn'
                     ))
                 else:
-                    print(f"ERROR: Audio file not found at {AUDIO_PATH}")
+                    print(f"ERROR: Audio file not found at {AUDIO_PATH}. Check Coolify volume!")
             else:
                 print("Waiting to become a speaker before playing audio...")
                 
