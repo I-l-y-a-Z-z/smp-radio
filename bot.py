@@ -2,9 +2,11 @@ import discord
 from discord.ext import tasks
 import os
 import asyncio
+import subprocess
 from dotenv import load_dotenv
 import datetime
 import traceback
+import logging
 
 load_dotenv()
 
@@ -18,8 +20,14 @@ bot = discord.Bot(intents=intents)
 AUDIO_PATH = "/app/audio/non_stop_pop.mp3"
 STAGE_TOPIC = "24/7 Non-Stop Pop FM"
 
-# Prevents the heartbeat loop and voice events from racing each other
 _connect_lock = asyncio.Lock()
+
+# Enable verbose Discord voice logging so we can see packet-level issues
+logging.basicConfig(level=logging.INFO)
+dlog = logging.getLogger("discord.voice_client")
+dlog.setLevel(logging.DEBUG)
+glog = logging.getLogger("discord.gateway")
+glog.setLevel(logging.WARNING)
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────
@@ -30,7 +38,6 @@ def log(tag, msg):
 
 
 async def cleanup_vc(vc):
-    """Fully tear down a VoiceClient — stop audio, disconnect, wipe state."""
     if vc is None:
         return
     try:
@@ -49,7 +56,6 @@ async def cleanup_vc(vc):
 
 
 def ffmpeg_alive(vc):
-    """Return True only if the underlying FFmpeg process is still running."""
     try:
         src = vc.source
         if src is None:
@@ -58,27 +64,28 @@ def ffmpeg_alive(vc):
         proc = getattr(inner, "_process", None)
         if proc is None:
             return False
-        return proc.poll() is None          # None = still alive
+        return proc.poll() is None
     except Exception:
         return False
 
 
 def start_playback(vc):
-    """Hand the audio file to FFmpeg and start playing on the voice client."""
     def after_playback(error):
         if error:
             log("FFMPEG", f"🔥 Playback crashed: {error}")
         else:
             log("FFMPEG", "Playback ended (file finished or stopped).")
 
-    source = discord.FFmpegOpusAudio(
+    # Use FFmpegPCMAudio — the most reliable and well-tested path in py-cord.
+    # py-cord's VoiceClient.send_audio_packet() handles opus encoding internally.
+    # We avoid FFmpegOpusAudio because -stream_loop can break the ogg container framing.
+    source = discord.FFmpegPCMAudio(
         AUDIO_PATH,
         before_options="-stream_loop -1",
-        options="-vn",
-        bitrate=128,
+        options="-vn"
     )
     vc.play(source, after=after_playback)
-    log("DJ", "▶️ Playback started.")
+    log("DJ", "▶️ Playback started (FFmpegPCMAudio).")
 
 
 # ─── Boot ───────────────────────────────────────────────────────────────
@@ -87,7 +94,7 @@ def start_playback(vc):
 async def on_ready():
     log("BOOT", f"Logged in as {bot.user}")
 
-    # Load Opus (required for voice)
+    # Opus
     if not discord.opus.is_loaded():
         for lib in ("libopus.so.0", "libopus.so", "opus"):
             try:
@@ -96,17 +103,51 @@ async def on_ready():
             except Exception:
                 continue
 
-    if discord.opus.is_loaded():
-        log("BOOT", "✅ Opus ready.")
+    log("BOOT", f"Opus loaded: {discord.opus.is_loaded()}")
+
+    # PyNaCl check — required for voice encryption
+    try:
+        import nacl
+        log("BOOT", f"✅ PyNaCl version: {nacl.__version__}")
+    except ImportError:
+        log("BOOT", "❌ FATAL: PyNaCl is NOT installed. Voice encryption will fail silently!")
+
+    # FFmpeg check
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True, text=True, timeout=5
+        )
+        first_line = result.stdout.split("\n")[0] if result.stdout else "unknown"
+        log("BOOT", f"✅ FFmpeg: {first_line}")
+    except Exception as e:
+        log("BOOT", f"❌ FFmpeg not found: {e}")
+
+    # Audio file check
+    if os.path.exists(AUDIO_PATH):
+        size_mb = os.path.getsize(AUDIO_PATH) / (1024 * 1024)
+        log("BOOT", f"✅ Audio file found: {AUDIO_PATH} ({size_mb:.1f} MB)")
+
+        # Probe the audio file to make sure FFmpeg can read it
+        try:
+            probe = subprocess.run(
+                ["ffmpeg", "-i", AUDIO_PATH, "-f", "null", "-t", "1", "-"],
+                capture_output=True, text=True, timeout=10
+            )
+            if probe.returncode == 0:
+                log("BOOT", "✅ Audio file is readable by FFmpeg.")
+            else:
+                log("BOOT", f"⚠️ FFmpeg probe stderr: {probe.stderr[-500:]}")
+        except Exception as e:
+            log("BOOT", f"⚠️ Could not probe audio: {e}")
     else:
-        log("BOOT", "❌ FATAL: Opus could not be loaded — audio will not work.")
+        log("BOOT", f"❌ Audio file NOT found: {AUDIO_PATH}")
 
     if not dj_loop.is_running():
         dj_loop.start()
 
 
 # ─── Voice State Handler ───────────────────────────────────────────────
-# Reacts to Discord-side changes: kicks, audience demotion, moves.
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -117,16 +158,16 @@ async def on_voice_state_update(member, before, after):
     a_ch = getattr(after.channel, "name", None)
     log("VOICE", f"{b_ch} → {a_ch} | suppress={after.suppress}")
 
-    # ── Disconnected / Kicked ──
+    # Disconnected / Kicked
     if before.channel is not None and after.channel is None:
-        log("VOICE", "Disconnected — cleaning up so DJ loop can reconnect.")
+        log("VOICE", "Disconnected — cleaning up.")
         async with _connect_lock:
             await cleanup_vc(member.guild.voice_client)
         return
 
-    # ── Moved to audience ──
+    # Moved to audience
     if after.channel is not None and after.suppress:
-        log("VOICE", "Placed in audience — requesting speaker.")
+        log("VOICE", "In audience — requesting speaker.")
         try:
             await member.edit(suppress=False)
         except discord.HTTPException as e:
@@ -134,64 +175,54 @@ async def on_voice_state_update(member, before, after):
 
 
 # ─── DJ Loop ───────────────────────────────────────────────────────────
-# Runs every 10 seconds.  Each tick walks through a strict checklist:
-#   1. Channel exists?
-#   2. Stage instance live?
-#   3. Connected to voice?
-#   4. Speaker (not audience)?
-#   5. Audio actually flowing?
 
 @tasks.loop(seconds=10)
 async def dj_loop():
     log("DJ", "─── tick ───")
 
     try:
-        # ── 1. Resolve the Stage Channel ──────────────────────────────
+        # ── 1. Resolve Channel ────────────────────────────────────────
         channel = bot.get_channel(STAGE_ID)
         if channel is None:
             try:
                 channel = await bot.fetch_channel(STAGE_ID)
             except discord.NotFound:
-                log("DJ", f"❌ Channel {STAGE_ID} does not exist. Sleeping.")
+                log("DJ", f"❌ Channel {STAGE_ID} does not exist.")
                 return
             except discord.Forbidden:
                 log("DJ", f"❌ No access to channel {STAGE_ID}.")
                 return
             except Exception as e:
-                log("DJ", f"❌ Could not fetch channel: {e}")
+                log("DJ", f"❌ Fetch error: {e}")
                 return
 
         if not isinstance(channel, discord.StageChannel):
-            log("DJ", f"❌ Channel is a {type(channel).__name__}, not a StageChannel.")
+            log("DJ", f"❌ Not a StageChannel: {type(channel).__name__}")
             return
 
         guild = channel.guild
 
-        # ── 2. Ensure a Stage Instance is live ────────────────────────
+        # ── 2. Stage Instance ─────────────────────────────────────────
         try:
             if channel.instance is None:
-                log("DJ", "Stage is not live — creating instance…")
+                log("DJ", "Creating stage instance…")
                 await channel.create_instance(topic=STAGE_TOPIC)
                 log("DJ", "✅ Stage instance created.")
         except discord.HTTPException as e:
-            if e.code == 150006:        # "already has an active instance"
-                pass
-            else:
-                log("DJ", f"⚠️ Stage instance issue: {e}")
+            if e.code != 150006:
+                log("DJ", f"⚠️ Stage instance: {e}")
         except Exception as e:
-            log("DJ", f"⚠️ Stage instance check error: {e}")
+            log("DJ", f"⚠️ Stage check: {e}")
 
         # ── 3. Voice Connection ───────────────────────────────────────
         async with _connect_lock:
             vc = guild.voice_client
 
-            # Zombie VC: object exists but socket is dead
             if vc is not None and not vc.is_connected():
-                log("DJ", "⚠️ Zombie VC (exists but disconnected). Tearing down…")
+                log("DJ", "⚠️ Zombie VC. Tearing down…")
                 await cleanup_vc(vc)
                 vc = None
 
-            # Not connected at all — join
             if vc is None:
                 log("DJ", "Connecting…")
                 try:
@@ -199,71 +230,74 @@ async def dj_loop():
                         channel.connect(timeout=10.0),
                         timeout=15.0,
                     )
-                    log("DJ", "✅ Connected to voice.")
-                    await asyncio.sleep(1.5)        # let Discord settle
+                    log("DJ", "✅ Connected.")
+                    await asyncio.sleep(2)
                 except asyncio.TimeoutError:
-                    log("DJ", "⚠️ Handshake timed out. Will retry.")
+                    log("DJ", "⚠️ Timed out. Retry next tick.")
                     return
                 except discord.ClientException as e:
-                    # "Already connected" — grab the existing VC
-                    log("DJ", f"⚠️ ClientException: {e}")
+                    log("DJ", f"⚠️ {e}")
                     vc = guild.voice_client
                 except Exception as e:
-                    log("DJ", f"❌ Connection failed: {e}")
+                    log("DJ", f"❌ Connect failed: {e}")
                     return
 
-        # Final gate — if still nothing, bail
         if vc is None or not vc.is_connected():
-            log("DJ", "Still not connected. Will retry next tick.")
+            log("DJ", "Not connected. Retry next tick.")
             return
 
         # ── 4. Speaker Check ──────────────────────────────────────────
         me = guild.me
         if me.voice is None:
-            log("DJ", "⚠️ No voice state yet. Will retry.")
+            log("DJ", "⚠️ No voice state. Retry next tick.")
             return
 
         if me.voice.suppress:
             log("DJ", "In audience — requesting speaker…")
             try:
                 await me.edit(suppress=False)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(1.5)
             except discord.HTTPException as e:
-                log("DJ", f"Speaker request failed: {e}")
-            # Re-check
+                log("DJ", f"Speaker failed: {e}")
             if me.voice and me.voice.suppress:
-                log("DJ", "Still suppressed. Will retry next tick.")
+                log("DJ", "Still suppressed. Retry next tick.")
                 return
 
-        # ── 5. Audio Playback ─────────────────────────────────────────
+        # Log detailed VC state for diagnosis
+        log("DJ", f"VC state: connected={vc.is_connected()} playing={vc.is_playing()} paused={vc.is_paused()}")
+        log("DJ", f"VC endpoint: {getattr(vc, 'endpoint', 'N/A')}")
+        log("DJ", f"VC SSRC: {getattr(vc, 'ssrc', 'N/A')}")
+
+        # ── 5. Audio ──────────────────────────────────────────────────
         if vc.is_playing():
             if ffmpeg_alive(vc):
-                log("DJ", "✅ Playing & FFmpeg alive.")
+                # Peek at the source to verify data flow
+                src = vc.source
+                inner = getattr(src, "original", src)
+                proc = getattr(inner, "_process", None)
+                log("DJ", f"✅ Playing. FFmpeg PID={proc.pid if proc else '?'}")
                 return
-            # Zombie audio — flag says playing but FFmpeg is dead
-            log("DJ", "⚠️ Zombie audio detected — stopping…")
+            log("DJ", "⚠️ Zombie audio. Stopping…")
             try:
                 vc.stop()
             except Exception:
                 pass
             await asyncio.sleep(0.5)
 
-        # If we're paused for some reason, just resume
         if vc.is_paused():
-            log("DJ", "Resuming paused playback…")
+            log("DJ", "Resuming…")
             vc.resume()
             return
 
-        # Make sure the file exists before handing it to FFmpeg
         if not os.path.exists(AUDIO_PATH):
-            log("DJ", f"❌ Audio file not found: {AUDIO_PATH}")
+            log("DJ", f"❌ File missing: {AUDIO_PATH}")
             return
 
         log("DJ", "▶️ All checks passed — starting playback…")
         start_playback(vc)
 
     except Exception as e:
-        log("DJ", f"🔥 Unhandled error: {e}")
+        log("DJ", f"🔥 Unhandled: {e}")
         traceback.print_exc()
 
 
