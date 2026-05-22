@@ -11,14 +11,14 @@ import logging
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-STAGE_ID = int(os.getenv("STAGE_ID"))
+# Fallback to STAGE_ID if CHANNEL_ID is not set in .env yet
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", os.getenv("STAGE_ID")))
 
 intents = discord.Intents.default()
 intents.voice_states = True
 bot = discord.Bot(intents=intents)
 
 AUDIO_PATH = "/app/audio/non_stop_pop.mp3"
-STAGE_TOPIC = "24/7 Non-Stop Pop FM"
 
 # Verbose voice logging for diagnostics
 logging.basicConfig(level=logging.INFO)
@@ -68,10 +68,6 @@ async def on_ready():
 
 
 # ─── Voice State Handler ───────────────────────────────────────────────
-# IMPORTANT: This handler ONLY logs. It does NOT call disconnect, cleanup,
-# or edit(suppress). Doing so during py-cord's internal state transitions
-# corrupts the voice socket and causes silent audio on the next connection.
-# The DJ loop handles everything: reconnection, speaker status, playback.
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -80,17 +76,15 @@ async def on_voice_state_update(member, before, after):
 
     b = getattr(before.channel, "name", None)
     a = getattr(after.channel, "name", None)
-    log("VOICE", f"{b} → {a} | suppress={after.suppress}")
+    log("VOICE", f"{b} → {a}")
 
 
 # ─── DJ Loop ───────────────────────────────────────────────────────────
 # Single source of truth. Runs every 10s and walks a strict checklist:
 #
-#   1. Channel exists & is a StageChannel?
-#   2. Stage instance is live?
-#   3. Voice client connected?  (clean up zombies, reconnect if needed)
-#   4. Bot is a speaker?        (request unsuppress if needed)
-#   5. Audio is playing?        (start or restart if zombie)
+#   1. Channel exists & is a VoiceChannel?
+#   2. Voice client connected?  (clean up zombies, reconnect if needed)
+#   3. Audio is playing?        (start or restart if zombie)
 #
 # All recovery actions happen HERE, in sequence, never concurrently.
 
@@ -100,47 +94,33 @@ async def dj_loop():
 
     try:
         # ── 1. Resolve Channel ────────────────────────────────────────
-        channel = bot.get_channel(STAGE_ID)
+        channel = bot.get_channel(CHANNEL_ID)
         if channel is None:
             try:
-                channel = await bot.fetch_channel(STAGE_ID)
+                channel = await bot.fetch_channel(CHANNEL_ID)
             except discord.NotFound:
-                log("DJ", f"❌ Channel {STAGE_ID} not found.")
+                log("DJ", f"❌ Channel {CHANNEL_ID} not found.")
                 return
             except discord.Forbidden:
-                log("DJ", f"❌ No access to {STAGE_ID}.")
+                log("DJ", f"❌ No access to {CHANNEL_ID}.")
                 return
             except Exception as e:
                 log("DJ", f"❌ Fetch error: {e}")
                 return
 
-        if not isinstance(channel, discord.StageChannel):
-            log("DJ", f"❌ Not a StageChannel ({type(channel).__name__}).")
+        if not isinstance(channel, discord.VoiceChannel) and not isinstance(channel, discord.StageChannel):
+            log("DJ", f"❌ Not a VoiceChannel ({type(channel).__name__}).")
             return
 
         guild = channel.guild
 
-        # ── 2. Stage Instance ─────────────────────────────────────────
-        try:
-            if channel.instance is None:
-                log("DJ", "Creating stage instance…")
-                await channel.create_instance(topic=STAGE_TOPIC)
-                log("DJ", "✅ Stage created.")
-        except discord.HTTPException as e:
-            if e.code != 150006:
-                log("DJ", f"⚠️ Stage: {e}")
-        except Exception as e:
-            log("DJ", f"⚠️ Stage check: {e}")
-
-        # ── 3. Voice Connection ───────────────────────────────────────
+        # ── 2. Voice Connection ───────────────────────────────────────
         vc = guild.voice_client
 
-        # 3a. Zombie: VC object exists but the socket is dead
+        # 2a. Zombie: VC object exists but the socket is dead
         if vc is not None and not vc.is_connected():
             log("DJ", "⚠️ Zombie VC detected. Waiting for py-cord cleanup…")
-            # Give py-cord time to finish its internal cleanup
             await asyncio.sleep(3)
-            # Re-check — py-cord may have cleaned it up by now
             vc = guild.voice_client
             if vc is not None and not vc.is_connected():
                 log("DJ", "Zombie still present. Force-cleaning…")
@@ -154,7 +134,7 @@ async def dj_loop():
                     pass
                 vc = None
 
-        # 3b. Not connected — join fresh
+        # 2b. Not connected — join fresh
         if vc is None:
             log("DJ", "Connecting…")
             try:
@@ -178,67 +158,14 @@ async def dj_loop():
                 return
 
             # CRITICAL: Let the voice protocol fully settle.
-            # The socket reader, UDP socket, and encryption state all need
-            # time to initialize. Starting playback too early = silent audio.
             log("DJ", "Waiting for voice protocol to settle…")
             await asyncio.sleep(4)
 
-            # Re-verify after the wait
             if not vc.is_connected():
                 log("DJ", "Lost connection during settle. Retry next tick.")
                 return
 
-        # ── 4. Speaker Check & DAVE Sync ──────────────────────────────
-        me = guild.me
-        if me.voice is None:
-            log("DJ", "⚠️ No voice state yet.")
-            return
-
-        # DAVE (E2EE) Stage Channel Bug Workaround:
-        # If the bot connects and is already a speaker, or if it transitions
-        # state without Discord sending the proper DAVE key epochs, it sends
-        # packets with the wrong keys (green halo, no audio).
-        # Forcing an audience -> speaker transition triggers a fresh key exchange.
-        if not getattr(vc, "dave_synced", False):
-            log("DJ", "Performing DAVE E2EE key sync...")
-            try:
-                # Force audience state first
-                if not me.voice.suppress:
-                    await me.edit(suppress=True)
-                    await asyncio.sleep(1.5)
-                
-                # Now force speaker state to trigger DAVE transition opcodes
-                await me.edit(suppress=False)
-                await asyncio.sleep(2.5)
-                
-                # Verify
-                me = guild.me
-                if me.voice and not me.voice.suppress:
-                    log("DJ", "✅ Speaker state verified & DAVE synced.")
-                    vc.dave_synced = True
-                else:
-                    log("DJ", "⚠️ Failed to become speaker. Will retry.")
-                    return
-            except discord.HTTPException as e:
-                log("DJ", f"DAVE sync failed: {e}")
-                return
-        else:
-            # Already synced this connection, just ensure we are still a speaker
-            if me.voice.suppress:
-                log("DJ", "In audience → requesting speaker…")
-                try:
-                    await me.edit(suppress=False)
-                    await asyncio.sleep(2)
-                except discord.HTTPException as e:
-                    log("DJ", f"Speaker request failed: {e}")
-                    return
-                me = guild.me
-                if me.voice is None or me.voice.suppress:
-                    log("DJ", "Still suppressed. Retry next tick.")
-                    return
-                log("DJ", "✅ Now a speaker.")
-
-        # ── 5. Audio Playback ─────────────────────────────────────────
+        # ── 3. Audio Playback ─────────────────────────────────────────
         log("DJ", f"State: connected={vc.is_connected()} playing={vc.is_playing()} "
                    f"endpoint={getattr(vc, 'endpoint', '?')} ssrc={getattr(vc, 'ssrc', '?')}")
 
