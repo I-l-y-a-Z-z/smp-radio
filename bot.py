@@ -151,9 +151,37 @@ async def heartbeat_loop():
             log("DJ-AUDIO-CHECK", f"My Voice State Exists: {my_voice is not None} | Suppressed: {my_voice.suppress if my_voice else 'N/A'}")
 
             if my_voice and not my_voice.suppress:
-                log("DJ-AUDIO-CHECK", f"Is Playing Currently: {vc.is_playing()}")
+                is_playing = vc.is_playing()
+                log("DJ-AUDIO-CHECK", f"Is Playing Currently: {is_playing}")
 
-                if not vc.is_playing():
+                # ZOMBIE AUDIO DETECTION: is_playing() can return True even when
+                # FFmpeg has silently died and no audio data is actually flowing.
+                if is_playing:
+                    source_is_alive = False
+                    try:
+                        src = vc.source
+                        if src is not None:
+                            # Unwrap PCMVolumeTransformer to get the FFmpegPCMAudio
+                            inner = getattr(src, 'original', src)
+                            proc = getattr(inner, '_process', None)
+                            if proc is not None and proc.poll() is None:
+                                source_is_alive = True
+                            else:
+                                log("DJ-ZOMBIE", f"⚠️ FFmpeg process is dead (poll={proc.poll() if proc else 'no-proc'}). Killing zombie player...")
+                        else:
+                            log("DJ-ZOMBIE", "⚠️ vc.source is None but is_playing()=True. Killing zombie player...")
+                    except Exception as e:
+                        log("DJ-ZOMBIE", f"⚠️ Error inspecting audio source: {e}. Killing zombie player...")
+
+                    if not source_is_alive:
+                        try:
+                            vc.stop()
+                        except Exception:
+                            pass
+                        is_playing = False
+                        log("DJ-ZOMBIE", "Zombie player killed. Will restart on this tick.")
+
+                if not is_playing:
                     log("DJ-AUDIO-CHECK", f"Checking file path: {AUDIO_PATH}")
                     if os.path.exists(AUDIO_PATH):
                         log("DJ-PLAY", "▶️ ALL CHECKS PASSED. Handing file to FFmpeg...")
