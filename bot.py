@@ -23,14 +23,32 @@ STAGE_TOPIC = "24/7 Non-Stop Pop FM"
 # Diagnostic Logger
 def log(module, message):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] [{module}] {message}")
+    print(f"[{timestamp}] [{module}] {message}", flush=True)
+
 
 @bot.event
 async def on_ready():
     log("SYSTEM", f"✅ Logged in successfully as {bot.user}")
+
+    # Check opus is loaded (required for Stage channel audio)
+    if discord.opus.is_loaded():
+        log("SYSTEM", "✅ Opus library loaded successfully.")
+    else:
+        log("SYSTEM", "⚠️ Opus not auto-loaded. Attempting manual load...")
+        try:
+            discord.opus.load_opus("libopus.so.0")
+            log("SYSTEM", "✅ Opus loaded manually.")
+        except Exception as e:
+            try:
+                discord.opus.load_opus("libopus.so")
+                log("SYSTEM", "✅ Opus loaded manually (fallback name).")
+            except Exception as e2:
+                log("SYSTEM", f"❌ CRITICAL: Could not load Opus: {e2}. Audio will NOT work.")
+
     if not heartbeat_loop.is_running():
         log("SYSTEM", "Starting DJ Heartbeat Loop...")
         heartbeat_loop.start()
+
 
 # =====================================================================
 # THE BOUNCER: Strictly handles Event States, Permissions, and Cleanup
@@ -42,20 +60,18 @@ async def on_voice_state_update(member, before, after):
 
     log("BOUNCER", f"State Update Triggered -> Channel: {getattr(before.channel, 'name', 'None')} to {getattr(after.channel, 'name', 'None')} | Suppress: {after.suppress}")
 
-    # EDGE CASE 1: THE DISCONNECT / KICK 
+    # EDGE CASE 1: THE DISCONNECT / KICK
     if before.channel is not None and after.channel is None:
         log("BOUNCER-KICK", "Bot was disconnected. Deploying background socket execution...")
         vc = member.guild.voice_client
         if vc:
             if vc.is_playing():
-                vc.stop() 
-            
-            # THE FIX: Run the official disconnect as a background task. 
-            # This forces Py-cord to delete the ghost object without freezing the Bouncer!
+                vc.stop()
+
             async def execute_ghost(zombie_vc):
                 try:
                     await asyncio.wait_for(zombie_vc.disconnect(force=True), timeout=2.0)
-                except:
+                except Exception:
                     log("BOUNCER-KICK", "Disconnect timed out, forcing cache wipe...")
                 finally:
                     zombie_vc.cleanup()
@@ -77,7 +93,7 @@ async def on_voice_state_update(member, before, after):
 # =====================================================================
 # THE DJ: Strictly handles Connection Routing and Audio Playback
 # =====================================================================
-@tasks.loop(seconds=5) 
+@tasks.loop(seconds=5)
 async def heartbeat_loop():
     log("DJ-TICK", "--- Loop Triggered ---")
     try:
@@ -86,8 +102,8 @@ async def heartbeat_loop():
         if not channel:
             log("DJ-ERROR", f"❌ Cannot find Stage channel ID {STAGE_ID}")
             return
-            
-        # 2. Stage Instance Check 
+
+        # 2. Stage Instance Check
         if channel.instance is None:
             log("DJ-STAGE", "Stage is dead. Attempting to create Live instance...")
             try:
@@ -96,62 +112,70 @@ async def heartbeat_loop():
             except discord.HTTPException as e:
                 if e.code != 150006:
                     log("DJ-STAGE", f"Warning creating instance: {e}")
-                
+
         # Fetch the official voice client state
         vc = channel.guild.voice_client
         log("DJ-STATE", f"VC Exists: {vc is not None} | VC Connected: {vc.is_connected() if vc else False}")
-        
+
         # 3. Connection Logic
         if not vc or not vc.is_connected():
             log("DJ-CONNECT", "Bot is disconnected. Initiating UDP Handshake...")
-            
-            # THE FIX: If Py-cord tries to hand the DJ a dead, recycled socket, destroy it.
+
+            # Destroy any zombie VoiceClient before reconnecting
             if vc:
                 log("DJ-CONNECT", "⚠️ Zombie VoiceClient detected! Ripping it out before reconnecting...")
                 try:
                     await asyncio.wait_for(vc.disconnect(force=True), timeout=1.0)
-                except:
+                except Exception:
                     pass
                 vc.cleanup()
-            
+
             try:
                 await asyncio.wait_for(channel.connect(timeout=5.0), timeout=10.0)
                 log("DJ-CONNECT", "✅ UDP Handshake complete! Connected to voice servers.")
+                # Let Discord fully settle the connection and speaker state
+                await asyncio.sleep(1)
             except asyncio.TimeoutError:
                 log("DJ-CONNECT", "⚠️ Discord Voice Handshake timed out. Waiting for next loop...")
                 return
             except Exception as e:
                 log("DJ-CONNECT", f"❌ Connection exception: {e}")
                 return
-                
-        # Refresh VC state 
-        vc = channel.guild.voice_client 
-        
+
+        # Refresh VC state after potential reconnect
+        vc = channel.guild.voice_client
+
         # 4. Audio Playback Logic
         if vc and vc.is_connected():
             my_voice = channel.guild.me.voice
             log("DJ-AUDIO-CHECK", f"My Voice State Exists: {my_voice is not None} | Suppressed: {my_voice.suppress if my_voice else 'N/A'}")
-            
+
             if my_voice and not my_voice.suppress:
                 log("DJ-AUDIO-CHECK", f"Is Playing Currently: {vc.is_playing()}")
-                
+
                 if not vc.is_playing():
                     log("DJ-AUDIO-CHECK", f"Checking file path: {AUDIO_PATH}")
                     if os.path.exists(AUDIO_PATH):
                         log("DJ-PLAY", "▶️ ALL CHECKS PASSED. Handing file to FFmpeg...")
-                        
+
                         def ffmpeg_spy(error):
                             if error:
                                 log("FFMPEG-SPY", f"🔥 CRITICAL: FFmpeg process crashed! Error: {error}")
                             else:
                                 log("FFMPEG-SPY", "Stream ended gracefully (File finished or was manually stopped).")
 
-                        vc.play(discord.FFmpegPCMAudio(
-                            AUDIO_PATH, 
-                            before_options='-stream_loop -1', 
-                            options='-vn'
-                        ), after=ffmpeg_spy)
-                        
+                        # FIX: Wrap in PCMVolumeTransformer to trigger opus encoding pipeline.
+                        # Stage channels require properly encoded opus audio — raw PCM is silently dropped.
+                        source = discord.FFmpegPCMAudio(
+                            AUDIO_PATH,
+                            before_options="-stream_loop -1 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                            options="-vn -ar 48000 -ac 2 -b:a 128k"
+                        )
+                        vc.play(
+                            discord.PCMVolumeTransformer(source, volume=1.0),
+                            after=ffmpeg_spy
+                        )
+
                         log("DJ-PLAY", "FFmpeg play command executed.")
                     else:
                         log("DJ-ERROR", f"❌ File missing at {AUDIO_PATH}.")
@@ -159,10 +183,11 @@ async def heartbeat_loop():
                 log("DJ-PAUSE", "Waiting for Bouncer to secure speaker permissions...")
                 try:
                     await channel.guild.me.edit(suppress=False)
-                except:
+                except Exception:
                     pass
-                    
+
     except Exception as e:
         log("SYSTEM-ERROR", f"🔥 Unhandled Heartbeat Loop Error: {e}")
+
 
 bot.run(TOKEN)
