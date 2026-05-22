@@ -46,7 +46,7 @@ async def radio_loop():
             if os.path.exists(AUDIO_PATH):
                 print(f"Playing audio: {AUDIO_PATH}")
                 # Play the file with no video (-vn)
-                vc.play(discord.FFmpegPCMAudio(AUDIO_PATH, options='-vn'))
+                vc.play(discord.FFmpegPCMAudio(AUDIO_PATH, before_options='-stream_loop -1', options='-vn'))
             else:
                 print(f"ERROR: Audio file not found at {AUDIO_PATH}. Did the SFTP upload finish?")
                 
