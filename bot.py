@@ -25,6 +25,27 @@ async def on_ready():
     if not radio_loop.is_running():
         radio_loop.start()
 
+# --- THE MAGIC FIX: Instant Kick Detection ---
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # Check if the member being updated is the bot itself
+    if member.id == bot.user.id:
+        # If the bot was in a channel, but is now in None (Kicked/Disconnected)
+        if before.channel and after.channel is None:
+            print("🚨 KICK DETECTED: Instantly cleaning up ghost voice client...")
+            
+            # Fetch the official voice client from the guild
+            vc = before.channel.guild.voice_client
+            if vc:
+                if vc.is_playing():
+                    vc.stop() # Assassinate ghost FFmpeg
+                try:
+                    await vc.disconnect(force=True)
+                except:
+                    pass
+                vc.cleanup() # Wipe Py-cord memory
+            print("Cleanup complete. Awaiting loop to rebuild connection...")
+
 @tasks.loop(seconds=5)
 async def radio_loop():
     try:
@@ -37,26 +58,20 @@ async def radio_loop():
         if channel.instance is None:
             try:
                 await channel.create_instance(topic=STAGE_TOPIC)
-            except discord.HTTPException as e:
-                if e.code != 150006: # Ignore the "already open" cache bug
-                    pass
+            except discord.HTTPException:
+                pass # Ignore if already open
             
-        # 3. The Brute-Force Connection
-        vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
+        # 3. Connection Check (Using the official guild client)
+        vc = channel.guild.voice_client
         
         if not vc or not vc.is_connected():
-            print("Connecting/Reconnecting to Stage...")
-            if vc:
-                try:
-                    await vc.disconnect(force=True)
-                except:
-                    pass
-            
+            print("Connecting to Stage...")
             vc = await channel.connect()
             print("Connected! Becoming speaker...")
             try:
                 await channel.guild.me.edit(suppress=False)
-                await asyncio.sleep(1) # Give Discord 1 second to update status
+                # Give Discord Voice Servers exactly 2 seconds to sync the un-mute
+                await asyncio.sleep(2) 
             except:
                 pass
         else:
@@ -64,21 +79,17 @@ async def radio_loop():
             if channel.guild.me.voice and channel.guild.me.voice.suppress:
                 try:
                     await channel.guild.me.edit(suppress=False)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
                 except:
                     pass
             
-        # 4. The Brute-Force Play
+        # 4. The Audio Check
         if vc and vc.is_connected() and not vc.is_playing():
-            # Only play if we are confirmed as a speaker
+            # Only play if we are officially confirmed as a speaker
             if channel.guild.me.voice and not channel.guild.me.voice.suppress:
                 if os.path.exists(AUDIO_PATH):
-                    print(f"Starting track from the absolute beginning: {AUDIO_PATH}")
+                    print(f"▶️ Starting track: {AUDIO_PATH}")
                     
-                    # Forcefully execute any stuck audio on this connection
-                    vc.stop() 
-                    
-                    # Play fresh from 0:00
                     vc.play(discord.FFmpegPCMAudio(
                         AUDIO_PATH, 
                         before_options='-stream_loop -1', 
