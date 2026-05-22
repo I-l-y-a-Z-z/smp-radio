@@ -161,7 +161,7 @@ async def heartbeat_loop():
                     try:
                         src = vc.source
                         if src is not None:
-                            # Unwrap PCMVolumeTransformer to get the FFmpegPCMAudio
+                            # Unwrap to get the underlying FFmpeg process
                             inner = getattr(src, 'original', src)
                             proc = getattr(inner, '_process', None)
                             if proc is not None and proc.poll() is None:
@@ -192,15 +192,17 @@ async def heartbeat_loop():
                             else:
                                 log("FFMPEG-SPY", "Stream ended gracefully (File finished or was manually stopped).")
 
-                        # FIX: Wrap in PCMVolumeTransformer to trigger opus encoding pipeline.
-                        # Stage channels require properly encoded opus audio — raw PCM is silently dropped.
-                        source = discord.FFmpegPCMAudio(
+                        # Use FFmpegOpusAudio: FFmpeg encodes to opus directly.
+                        # This bypasses py-cord's internal opus encoder which can
+                        # silently fail on Stage channels, producing no audible output.
+                        source = discord.FFmpegOpusAudio(
                             AUDIO_PATH,
-                            before_options="-stream_loop -1",
-                            options="-vn -ar 48000 -ac 2 -b:a 128k"
+                            before_options="-stream_loop -1 -re",
+                            options="-vn",
+                            bitrate=128
                         )
                         vc.play(
-                            discord.PCMVolumeTransformer(source, volume=1.0),
+                            source,
                             after=ffmpeg_spy
                         )
 
