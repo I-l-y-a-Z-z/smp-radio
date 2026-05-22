@@ -37,39 +37,51 @@ async def radio_loop():
             
         # 2. Check if Stage instance exists (Live Stage)
         if channel.instance is None:
-            print("Stage is not Live. Creating Stage instance...")
             try:
                 await channel.create_instance(topic=STAGE_TOPIC)
-            except Exception as e:
-                print(f"Warning creating instance: {e}")
+                print("Stage created successfully!")
+            except discord.HTTPException as e:
+                # Error 150006 means the Stage is already open, our cache is just blind.
+                if e.code == 150006:
+                    pass # Safely ignore and continue!
+                else:
+                    print(f"Warning creating instance: {e}")
             
         # 3. Check if bot is connected to the channel
         vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
         
         if not vc or not vc.is_connected():
-            # This triggers on boot, if Discord kicks it, or if YOU kick it
             print("Bot is not in the channel. Connecting...")
             vc = await channel.connect()
             print("Connected! Requesting to speak...")
-            await channel.guild.me.edit(suppress=False)
+            try:
+                await channel.guild.me.edit(suppress=False)
+            except discord.HTTPException as e:
+                print(f"Permission Error trying to speak: {e}")
         else:
-            # Failsafe: If the bot is connected but you manually moved it to the audience
+            # Failsafe: If the bot is connected but muted/in audience
             if channel.guild.me.voice and channel.guild.me.voice.suppress:
                 print("Bot was moved to audience. Reclaiming speaker status...")
-                await channel.guild.me.edit(suppress=False)
+                try:
+                    await channel.guild.me.edit(suppress=False)
+                except discord.HTTPException as e:
+                    print(f"Permission Error reclaiming speaker: {e}")
             
         # 4. Check if the audio is actively playing
         if vc and vc.is_connected() and not vc.is_playing():
-            if os.path.exists(AUDIO_PATH):
-                print(f"Starting/Restarting track from the beginning: {AUDIO_PATH}")
-                # Play the file natively using FFmpeg's infinite stream loop flag
-                vc.play(discord.FFmpegPCMAudio(
-                    AUDIO_PATH, 
-                    before_options='-stream_loop -1', 
-                    options='-vn'
-                ))
+            # Only try to play if we are actually a speaker (not suppressed)
+            if channel.guild.me.voice and not channel.guild.me.voice.suppress:
+                if os.path.exists(AUDIO_PATH):
+                    print(f"Starting audio: {AUDIO_PATH}")
+                    vc.play(discord.FFmpegPCMAudio(
+                        AUDIO_PATH, 
+                        before_options='-stream_loop -1', 
+                        options='-vn'
+                    ))
+                else:
+                    print(f"ERROR: Audio file not found at {AUDIO_PATH}")
             else:
-                print(f"ERROR: Audio file not found at {AUDIO_PATH}. Check Coolify volume!")
+                print("Waiting to become a speaker before playing audio...")
                 
     except Exception as e:
         print(f"Radio Loop Error: {e}")
