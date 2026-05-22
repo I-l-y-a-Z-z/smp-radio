@@ -188,27 +188,55 @@ async def dj_loop():
                 log("DJ", "Lost connection during settle. Retry next tick.")
                 return
 
-        # ── 4. Speaker Check ──────────────────────────────────────────
+        # ── 4. Speaker Check & DAVE Sync ──────────────────────────────
         me = guild.me
         if me.voice is None:
             log("DJ", "⚠️ No voice state yet.")
             return
 
-        if me.voice.suppress:
-            log("DJ", "In audience → requesting speaker…")
+        # DAVE (E2EE) Stage Channel Bug Workaround:
+        # If the bot connects and is already a speaker, or if it transitions
+        # state without Discord sending the proper DAVE key epochs, it sends
+        # packets with the wrong keys (green halo, no audio).
+        # Forcing an audience -> speaker transition triggers a fresh key exchange.
+        if not getattr(vc, "dave_synced", False):
+            log("DJ", "Performing DAVE E2EE key sync...")
             try:
+                # Force audience state first
+                if not me.voice.suppress:
+                    await me.edit(suppress=True)
+                    await asyncio.sleep(1.5)
+                
+                # Now force speaker state to trigger DAVE transition opcodes
                 await me.edit(suppress=False)
+                await asyncio.sleep(2.5)
+                
+                # Verify
+                me = guild.me
+                if me.voice and not me.voice.suppress:
+                    log("DJ", "✅ Speaker state verified & DAVE synced.")
+                    vc.dave_synced = True
+                else:
+                    log("DJ", "⚠️ Failed to become speaker. Will retry.")
+                    return
             except discord.HTTPException as e:
-                log("DJ", f"Speaker request failed: {e}")
+                log("DJ", f"DAVE sync failed: {e}")
                 return
-            # Wait for Discord to process the speaker change
-            await asyncio.sleep(2)
-            # Re-fetch voice state
-            me = guild.me
-            if me.voice is None or me.voice.suppress:
-                log("DJ", "Still suppressed. Retry next tick.")
-                return
-            log("DJ", "✅ Now a speaker.")
+        else:
+            # Already synced this connection, just ensure we are still a speaker
+            if me.voice.suppress:
+                log("DJ", "In audience → requesting speaker…")
+                try:
+                    await me.edit(suppress=False)
+                    await asyncio.sleep(2)
+                except discord.HTTPException as e:
+                    log("DJ", f"Speaker request failed: {e}")
+                    return
+                me = guild.me
+                if me.voice is None or me.voice.suppress:
+                    log("DJ", "Still suppressed. Retry next tick.")
+                    return
+                log("DJ", "✅ Now a speaker.")
 
         # ── 5. Audio Playback ─────────────────────────────────────────
         log("DJ", f"State: connected={vc.is_connected()} playing={vc.is_playing()} "
