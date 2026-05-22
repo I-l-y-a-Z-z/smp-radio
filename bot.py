@@ -37,34 +37,23 @@ async def on_ready():
 # =====================================================================
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # Only react to the bot's own state changes
     if member.id != bot.user.id:
         return
 
     log("BOUNCER", f"State Update Triggered -> Channel: {getattr(before.channel, 'name', 'None')} to {getattr(after.channel, 'name', 'None')} | Suppress: {after.suppress}")
 
-    # EDGE CASE 1: THE DISCONNECT / KICK (Zombie Process Prevention)
+    # EDGE CASE 1: THE DISCONNECT / KICK 
     if before.channel is not None and after.channel is None:
-        log("BOUNCER-KICK", "Bot was disconnected. Executing nuclear cleanup...")
+        log("BOUNCER-KICK", "Bot was disconnected. Executing instant local cleanup...")
         vc = member.guild.voice_client
         if vc:
             log("BOUNCER-KICK", f"Found dead VC. is_playing: {vc.is_playing()}")
             if vc.is_playing():
                 vc.stop() 
-            try:
-                log("BOUNCER-KICK", "Attempting forceful disconnect...")
-                await asyncio.wait_for(vc.disconnect(force=True), timeout=2.0)
-            except Exception as e:
-                log("BOUNCER-KICK", f"Force disconnect failed/timed out: {e}")
             
-            log("BOUNCER-KICK", "Wiping Py-cord cache...")
+            # THE FIX: No awaited network commands! Just instantly wipe the local memory.
             vc.cleanup() 
-            
-        try:
-            log("BOUNCER-KICK", "Forcing backend routing drop...")
-            await member.guild.change_voice_state(channel=None)
-        except Exception as e:
-            log("BOUNCER-KICK", f"Backend routing drop failed: {e}")
+            log("BOUNCER-KICK", "Local cache wiped instantly. No race conditions.")
         return
 
     # EDGE CASE 2: THE AUDIENCE TRAP
@@ -92,7 +81,7 @@ async def heartbeat_loop():
             
         # 2. Stage Instance Check 
         if channel.instance is None:
-            log("DJ-STAGE", "Stage is completely dead. Attempting to create Live instance...")
+            log("DJ-STAGE", "Stage is dead. Attempting to create Live instance...")
             try:
                 await channel.create_instance(topic=STAGE_TOPIC)
                 log("DJ-STAGE", "Live Stage instance created!")
@@ -133,7 +122,6 @@ async def heartbeat_loop():
                     if os.path.exists(AUDIO_PATH):
                         log("DJ-PLAY", "▶️ ALL CHECKS PASSED. Handing file to FFmpeg...")
                         
-                        # THE FFMPEG SPY
                         def ffmpeg_spy(error):
                             if error:
                                 log("FFMPEG-SPY", f"🔥 CRITICAL: FFmpeg process crashed! Error: {error}")
@@ -148,7 +136,7 @@ async def heartbeat_loop():
                         
                         log("DJ-PLAY", "FFmpeg play command executed.")
                     else:
-                        log("DJ-ERROR", f"❌ File missing at {AUDIO_PATH}. Did the Coolify volume mount fail?")
+                        log("DJ-ERROR", f"❌ File missing at {AUDIO_PATH}.")
             else:
                 log("DJ-PAUSE", "Waiting for Bouncer to secure speaker permissions...")
                 try:
@@ -159,5 +147,4 @@ async def heartbeat_loop():
     except Exception as e:
         log("SYSTEM-ERROR", f"🔥 Unhandled Heartbeat Loop Error: {e}")
 
-# Run the bot
 bot.run(TOKEN)
