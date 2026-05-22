@@ -1,6 +1,7 @@
 import discord
 from discord.ext import tasks
 import os
+import asyncio
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -20,77 +21,119 @@ STAGE_TOPIC = "24/7 Non-Stop Pop FM"
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}")
+    print(f"✅ Logged in as {bot.user}")
     if not heartbeat_loop.is_running():
         heartbeat_loop.start()
 
-# --- THE BOUNCER: Strictly handles permissions and cleanup ---
+# =====================================================================
+# THE BOUNCER: Strictly handles Event States, Permissions, and Cleanup
+# =====================================================================
 @bot.event
 async def on_voice_state_update(member, before, after):
+    # Only react to the bot's own state changes
     if member.id != bot.user.id:
         return
 
-    # ANOMALY 2: THE DISCONNECT KICK
+    # EDGE CASE 1: THE DISCONNECT / KICK (Zombie Process Prevention)
     if before.channel is not None and after.channel is None:
-        print("🚨 BOUNCER (Kicked): Cleansing socket...")
+        print("🚨 BOUNCER: Bot was disconnected. Executing nuclear cleanup...")
         vc = member.guild.voice_client
         if vc:
             if vc.is_playing():
-                vc.stop()
+                vc.stop() # Assassinate the ghost FFmpeg process
             try:
-                await vc.disconnect(force=True)
+                # Timeout to prevent asynchronous deadlocks on dead sockets
+                await asyncio.wait_for(vc.disconnect(force=True), timeout=2.0)
             except:
                 pass
-            vc.cleanup()
+            vc.cleanup() # Wipe Py-cord's internal cache
+            
+        # Force Discord's backend routing to drop any ghost sessions
+        try:
+            await member.guild.change_voice_state(channel=None)
+        except:
+            pass
         return
 
-    # ANOMALY 1: THE AUDIENCE TRAP
+    # EDGE CASE 2: THE AUDIENCE TRAP
     if after.channel is not None and after.suppress:
-        print("🚨 BOUNCER (Audience Trap): Requesting Speaker Status...")
+        print("🚨 BOUNCER: Bot moved to audience. Requesting Speaker status...")
         try:
             await member.edit(suppress=False)
         except discord.HTTPException as e:
-            print(f"Failed to become speaker: {e}")
+            print(f"⚠️ BOUNCER: Failed to request speaker: {e}")
 
-# --- THE DJ: Strictly handles connection and audio ---
+
+# =====================================================================
+# THE DJ: Strictly handles Connection Routing and Audio Playback
+# =====================================================================
 @tasks.loop(seconds=5) 
 async def heartbeat_loop():
     try:
+        # 1. Fetch the Stage Channel
         channel = bot.get_channel(STAGE_ID) or await bot.fetch_channel(STAGE_ID)
         if not channel:
+            print(f"❌ DJ ERROR: Cannot find Stage channel {STAGE_ID}")
             return
             
+        # 2. Stage Instance Check (Create if Discord ended it)
         if channel.instance is None:
             try:
                 await channel.create_instance(topic=STAGE_TOPIC)
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as e:
+                # Ignore error 150006 (Stage already open, API cache desync)
+                if e.code != 150006:
+                    pass
                 
+        # Fetch the official voice client state
         vc = channel.guild.voice_client
         
-        # 1. Connect if offline
+        # 3. Connection Logic
         if not vc or not vc.is_connected():
-            print("🎧 DJ: Bot offline. Initiating connection...")
-            await channel.connect() 
+            print("🎧 DJ: Bot offline. Initiating UDP connection...")
+            try:
+                # EDGE CASE 3: The Infinite UDP Handshake Deadlock
+                # Wraps the connection in a strict 10-second guillotine timeout
+                await asyncio.wait_for(channel.connect(timeout=5.0), timeout=10.0)
+            except asyncio.TimeoutError:
+                print("⚠️ DJ: Discord Voice Handshake timed out. Breaking deadlock & retrying next loop...")
+                return
+            except Exception as e:
+                print(f"⚠️ DJ: Connection exception: {e}")
+                return
+                
+        # Refresh VC state immediately after a successful connection
+        vc = channel.guild.voice_client 
+        
+        # 4. Audio Playback Logic
+        if vc and vc.is_connected():
+            my_voice = channel.guild.me.voice
             
-        # 2. Play if connected AND speaker
-        elif vc.is_connected():
-            # Verify we are officially a speaker before touching audio
-            if channel.guild.me.voice and not channel.guild.me.voice.suppress:
+            # EDGE CASE 4: The Stage Race Condition
+            # ONLY touch the audio file if Discord mathematically confirms we are a speaker
+            if my_voice and not my_voice.suppress:
                 if not vc.is_playing():
                     if os.path.exists(AUDIO_PATH):
-                        print(f"▶️ DJ: Starting track...")
+                        print(f"▶️ DJ: Broadcasting infinite stream...")
+                        
+                        # EDGE CASE 5: Zero-Silence Looping (Native FFmpeg Loop)
                         vc.play(discord.FFmpegPCMAudio(
                             AUDIO_PATH, 
                             before_options='-stream_loop -1', 
                             options='-vn'
                         ))
                     else:
-                        print(f"ERROR: File not found at {AUDIO_PATH}")
+                        print(f"❌ DJ ERROR: Audio file not found at {AUDIO_PATH}")
             else:
-                print("🎧 DJ: Waiting for Bouncer to secure speaker permissions...")
-                
+                # Failsafe if the Bouncer hasn't secured speaker rights yet
+                print("🎧 DJ: Paused. Waiting for Bouncer to secure speaker permissions...")
+                try:
+                    await channel.guild.me.edit(suppress=False)
+                except:
+                    pass
+                    
     except Exception as e:
-        print(f"Heartbeat Loop Error: {e}")
+        print(f"🔥 System Loop Error: {e}")
 
+# Run the bot
 bot.run(TOKEN)
