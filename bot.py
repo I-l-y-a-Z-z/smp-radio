@@ -1,57 +1,56 @@
 import discord
-import yt_dlp
-import asyncio
+from discord.ext import tasks
 import os
 from dotenv import load_dotenv
 
-# This line loads the .env file if it exists
+# Load environment variables
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 STAGE_ID = int(os.getenv("STAGE_ID"))
-VIDEO_URL = os.getenv("VIDEO_URL") 
 
-bot = discord.Bot()
+# Initialize bot with required intents
+intents = discord.Intents.default()
+intents.voice_states = True
+bot = discord.Bot(intents=intents)
 
-ydl_opts = {
-    'format': 'bestaudio/best',
-    'quiet': True,
-}
-
-ffmpeg_options = {
-    'options': '-vn',
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
-}
+# This points to the volume we mapped in Coolify
+AUDIO_PATH = "/app/audio/non_stop_pop.mp3"
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    
+    if not radio_loop.is_running():
+        radio_loop.start()
+
+@tasks.loop(seconds=5)
+async def radio_loop():
     try:
-        # fetch_channel is more reliable than get_channel if the bot cache is empty
         channel = bot.get_channel(STAGE_ID) or await bot.fetch_channel(STAGE_ID)
         
         if not channel:
-            print(f"ERROR: Could not find channel with ID {STAGE_ID}. Check your .env file!")
+            print(f"ERROR: Cannot find Stage channel {STAGE_ID}")
             return
             
-        print(f"Found Stage: {channel.name}. Attempting to connect...")
-        vc = await channel.connect()
+        vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
         
-        print("Connected to Stage! Attempting to become a speaker...")
-        # This requires the Administrator or Mute Members permission
-        await channel.guild.me.edit(suppress=False)
-        print("Successfully became a speaker! Starting audio stream...")
-        
-        while True:
-            if not vc.is_playing():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(VIDEO_URL, download=False)
-                    url2 = info['url']
-                    vc.play(discord.FFmpegPCMAudio(url2, **ffmpeg_options))
-            await asyncio.sleep(5)
+        # Connect and become speaker if not already in the channel
+        if not vc or not vc.is_connected():
+            print("Connecting to Stage...")
+            vc = await channel.connect()
+            print("Connected! Requesting to speak...")
+            await channel.guild.me.edit(suppress=False)
             
+        # If the music stops (or hasn't started), play the local MP3
+        if vc and not vc.is_playing():
+            if os.path.exists(AUDIO_PATH):
+                print(f"Playing audio: {AUDIO_PATH}")
+                # Play the file with no video (-vn)
+                vc.play(discord.FFmpegPCMAudio(AUDIO_PATH, options='-vn'))
+            else:
+                print(f"ERROR: Audio file not found at {AUDIO_PATH}. Did the SFTP upload finish?")
+                
     except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
+        print(f"Radio Loop Error: {e}")
 
 bot.run(TOKEN)

@@ -1,5 +1,2 @@
-py-cord
-yt-dlp
-PyNaCl
-python-dotenv
 py-cord[voice]
+python-dotenv
