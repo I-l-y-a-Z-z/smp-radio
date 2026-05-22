@@ -1,7 +1,6 @@
 import discord
 from discord.ext import tasks
 import os
-import asyncio
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -25,18 +24,15 @@ async def on_ready():
     if not heartbeat_loop.is_running():
         heartbeat_loop.start()
 
-# --- THE DOMINO EFFECT: Event-Driven State Machine ---
+# --- THE BOUNCER: Strictly handles permissions and cleanup ---
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # Only react to the bot's own state changes
     if member.id != bot.user.id:
         return
 
     # ANOMALY 2: THE DISCONNECT KICK
     if before.channel is not None and after.channel is None:
-        print("🚨 ANOMALY 2 (Kicked): Cleansing socket and initiating re-entry...")
-        
-        # 1. Clean the ghost state
+        print("🚨 BOUNCER (Kicked): Cleansing socket...")
         vc = member.guild.voice_client
         if vc:
             if vc.is_playing():
@@ -46,79 +42,54 @@ async def on_voice_state_update(member, before, after):
             except:
                 pass
             vc.cleanup()
-            
-        # 2. Check Channel & Stage
-        channel = bot.get_channel(STAGE_ID) or await bot.fetch_channel(STAGE_ID)
-        if channel and channel.instance is None:
-            try:
-                await channel.create_instance(topic=STAGE_TOPIC)
-            except discord.HTTPException:
-                pass
-                
-        # 3. Join as Audience (This pushes Domino 1!)
-        print("Reconnecting to Stage... (Routing to Anomaly 1)")
-        if channel:
-            await channel.connect() 
         return
 
     # ANOMALY 1: THE AUDIENCE TRAP
-    # This triggers if you drag the bot manually, OR when Anomaly 2 successfully reconnects!
     if after.channel is not None and after.suppress:
-        print("🚨 ANOMALY 1 (Audience Trap): Pushing to Stage and starting audio...")
-        
-        vc = member.guild.voice_client
-        if vc:
-            # 1. Kill any ghost audio clinging to the transition
-            if vc.is_playing():
-                vc.stop()
-                
-            # 2. Force Speaker Status
-            try:
-                await member.edit(suppress=False)
-                await asyncio.sleep(2) # Give Discord routing 2 seconds to authorize
-            except discord.HTTPException as e:
-                print(f"Failed to become speaker: {e}")
-                return
-                
-            # 3. Blast the audio
-            if os.path.exists(AUDIO_PATH):
-                print(f"▶️ Playing track: {AUDIO_PATH}")
-                vc.play(discord.FFmpegPCMAudio(
-                    AUDIO_PATH, 
-                    before_options='-stream_loop -1', 
-                    options='-vn'
-                ))
-            else:
-                print(f"ERROR: File not found at {AUDIO_PATH}")
+        print("🚨 BOUNCER (Audience Trap): Requesting Speaker Status...")
+        try:
+            await member.edit(suppress=False)
+        except discord.HTTPException as e:
+            print(f"Failed to become speaker: {e}")
 
-# --- THE HEARTBEAT (Kickstarter) ---
-@tasks.loop(seconds=10)
+# --- THE DJ: Strictly handles connection and audio ---
+@tasks.loop(seconds=5) 
 async def heartbeat_loop():
     try:
         channel = bot.get_channel(STAGE_ID) or await bot.fetch_channel(STAGE_ID)
         if not channel:
             return
             
+        if channel.instance is None:
+            try:
+                await channel.create_instance(topic=STAGE_TOPIC)
+            except discord.HTTPException:
+                pass
+                
         vc = channel.guild.voice_client
         
-        # If the bot is completely offline (like on first VPS boot), push the first domino
+        # 1. Connect if offline
         if not vc or not vc.is_connected():
-            print("Heartbeat: Bot offline. Initiating boot sequence...")
-            if channel.instance is None:
-                try:
-                    await channel.create_instance(topic=STAGE_TOPIC)
-                except discord.HTTPException:
-                    pass
-            await channel.connect() # Triggers Anomaly 1!
+            print("🎧 DJ: Bot offline. Initiating connection...")
+            await channel.connect() 
             
-        # Failsafe: If the stream randomly crashes but the bot is still a speaker
-        elif vc and vc.is_connected() and not vc.is_playing():
+        # 2. Play if connected AND speaker
+        elif vc.is_connected():
+            # Verify we are officially a speaker before touching audio
             if channel.guild.me.voice and not channel.guild.me.voice.suppress:
-                if os.path.exists(AUDIO_PATH):
-                    print("Heartbeat Failsafe: Restarting dropped audio...")
-                    vc.play(discord.FFmpegPCMAudio(
-                        AUDIO_PATH, before_options='-stream_loop -1', options='-vn'
-                    ))
+                if not vc.is_playing():
+                    if os.path.exists(AUDIO_PATH):
+                        print(f"▶️ DJ: Starting track...")
+                        vc.play(discord.FFmpegPCMAudio(
+                            AUDIO_PATH, 
+                            before_options='-stream_loop -1', 
+                            options='-vn'
+                        ))
+                    else:
+                        print(f"ERROR: File not found at {AUDIO_PATH}")
+            else:
+                print("🎧 DJ: Waiting for Bouncer to secure speaker permissions...")
+                
     except Exception as e:
         print(f"Heartbeat Loop Error: {e}")
 
