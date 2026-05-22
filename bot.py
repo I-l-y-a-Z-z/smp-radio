@@ -19,15 +19,19 @@ bot = discord.Bot(intents=intents)
 AUDIO_PATH = "/app/audio/non_stop_pop.mp3"
 STAGE_TOPIC = "24/7 Non-Stop Pop FM"
 
+# --- THE FIX: Our own memory trap for the voice client ---
+active_vc = None 
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    # Start the self-healing loop once the bot boots up
     if not radio_loop.is_running():
         radio_loop.start()
 
 @tasks.loop(seconds=5)
 async def radio_loop():
+    global active_vc # Tell Python we are using our memory trap
+    
     try:
         # 1. Check if channel exists
         channel = bot.get_channel(STAGE_ID) or await bot.fetch_channel(STAGE_ID)
@@ -44,26 +48,38 @@ async def radio_loop():
             except discord.HTTPException as e:
                 # Error 150006 means the Stage is already open, our cache is just blind.
                 if e.code == 150006:
-                    pass # Safely ignore and continue
+                    pass 
                 else:
                     print(f"Warning creating instance: {e}")
             
-       # 3. Check if bot is connected to the channel
+        # 3. Check if bot is connected to the channel
         vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
         
         if not vc or not vc.is_connected():
             print("Bot is not in the channel. Rebuilding connection...")
             
-            # --- THE FIX: The Double-Tap Cleanup ---
-            if vc:
-                print("Killing zombie FFmpeg and cleaning cache...")
-                if vc.is_playing():
-                    vc.stop()  # Assasinates the stuck FFmpeg process
-                await vc.disconnect(force=True)
-                vc.cleanup()  # Wipes Py-cord's internal voice memory
-                await asyncio.sleep(1) # Give the Linux OS a second to clear the process
+            # --- THE FIX: Use our trapped VC to kill the zombie ---
+            if active_vc:
+                print("Executing trapped FFmpeg process and cleaning cache...")
+                try:
+                    if active_vc.is_playing():
+                        active_vc.stop()
+                    await active_vc.disconnect(force=True)
+                    active_vc.cleanup()
+                except Exception as e:
+                    print(f"Cleanup warning (safe to ignore): {e}")
+                active_vc = None
+            
+            # Force Discord API to clear any ghost sessions
+            try:
+                await channel.guild.change_voice_state(channel=None)
+                await asyncio.sleep(1)
+            except:
+                pass
                 
             vc = await channel.connect()
+            active_vc = vc  # Trap the new connection in our memory!
+            
             print("Connected! Requesting to speak...")
             try:
                 await channel.guild.me.edit(suppress=False)
@@ -71,6 +87,8 @@ async def radio_loop():
             except discord.HTTPException as e:
                 print(f"Permission Error trying to speak: {e}")
         else:
+            active_vc = vc  # Keep our memory updated if everything is fine
+            
             # Failsafe: If the bot is connected but muted/in audience
             if channel.guild.me.voice and channel.guild.me.voice.suppress:
                 print("Bot was moved to audience. Reclaiming speaker status...")
@@ -86,7 +104,6 @@ async def radio_loop():
             if channel.guild.me.voice and not channel.guild.me.voice.suppress:
                 if os.path.exists(AUDIO_PATH):
                     print(f"Starting/Restarting track: {AUDIO_PATH}")
-                    # Play the file natively using FFmpeg's infinite stream loop flag
                     vc.play(discord.FFmpegPCMAudio(
                         AUDIO_PATH, 
                         before_options='-stream_loop -1', 
