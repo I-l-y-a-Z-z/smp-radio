@@ -25,17 +25,20 @@ async def on_ready():
     if not radio_loop.is_running():
         radio_loop.start()
 
-# --- THE MAGIC FIX: Instant Kick Detection ---
+# --- THE UPGRADE: The "Nuclear" Event Listener ---
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # Check if the member being updated is the bot itself
     if member.id == bot.user.id:
-        # If the bot was in a channel, but is now in None (Kicked/Disconnected)
-        if before.channel and after.channel is None:
-            print("🚨 KICK DETECTED: Instantly cleaning up ghost voice client...")
+        
+        # Trigger cleanup if KICKED (channel becomes None) 
+        # OR if moved to AUDIENCE (suppress becomes True)
+        is_kicked = (before.channel and after.channel is None)
+        is_audience = (after.channel and after.suppress)
+
+        if is_kicked or is_audience:
+            print("🚨 STATE ANOMALY: Bot kicked or moved to audience. Initiating nuclear cleanup...")
             
-            # Fetch the official voice client from the guild
-            vc = before.channel.guild.voice_client
+            vc = member.guild.voice_client
             if vc:
                 if vc.is_playing():
                     vc.stop() # Assassinate ghost FFmpeg
@@ -44,7 +47,7 @@ async def on_voice_state_update(member, before, after):
                 except:
                     pass
                 vc.cleanup() # Wipe Py-cord memory
-            print("Cleanup complete. Awaiting loop to rebuild connection...")
+            print("Cleanup complete. Awaiting loop to rebuild fresh connection...")
 
 @tasks.loop(seconds=5)
 async def radio_loop():
@@ -74,14 +77,8 @@ async def radio_loop():
                 await asyncio.sleep(2) 
             except:
                 pass
-        else:
-            # Failsafe if dragged to audience
-            if channel.guild.me.voice and channel.guild.me.voice.suppress:
-                try:
-                    await channel.guild.me.edit(suppress=False)
-                    await asyncio.sleep(2)
-                except:
-                    pass
+            
+        # (Notice we removed the old Audience check here—the event listener handles it instantly now!)
             
         # 4. The Audio Check
         if vc and vc.is_connected() and not vc.is_playing():
