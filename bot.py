@@ -32,6 +32,12 @@ async def radio_loop():
             print(f"ERROR: Cannot find Stage channel {STAGE_ID}")
             return
             
+        # --- THE FIX: Auto-Restart the Stage Instance ---
+        if channel.instance is None:
+            print("Stage is not Live. Starting a new Stage instance...")
+            # You can change this topic string to whatever you want the Stage title to be!
+            await channel.create_instance(topic="24/7 Non-Stop Pop FM")
+            
         vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
         
         # Connect and become speaker if not already in the channel
@@ -45,10 +51,10 @@ async def radio_loop():
         if vc and not vc.is_playing():
             if os.path.exists(AUDIO_PATH):
                 print(f"Playing audio: {AUDIO_PATH}")
-                # Play the file with no video (-vn)
+                # Playing with the infinite loop flag
                 vc.play(discord.FFmpegPCMAudio(AUDIO_PATH, before_options='-stream_loop -1', options='-vn'))
             else:
-                print(f"ERROR: Audio file not found at {AUDIO_PATH}. Did the SFTP upload finish?")
+                print(f"ERROR: Audio file not found at {AUDIO_PATH}")
                 
     except Exception as e:
         print(f"Radio Loop Error: {e}")
